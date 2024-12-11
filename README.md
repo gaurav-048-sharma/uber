@@ -14,12 +14,12 @@ The `/users/register` endpoint is used to register a new user in the system. It 
 ## **Request Body**
 The following fields are required in the request body:
 
-| Field         | Type     | Description                          | Required |
-|---------------|----------|--------------------------------------|----------|
-| `name`        | `string` | The full name of the user            | Yes      |
-| `email`       | `string` | A valid email address                | Yes      |
-| `password`    | `string` | A strong password for the user       | Yes      |
-| `age`         | `number` | The age of the user (optional field) | No       |
+| Field                 | Type     | Description                                  | Required |
+|-----------------------|----------|----------------------------------------------|----------|
+| `fullname.firstname`  | `string` | The first name of the user (min length: 3)  | Yes      |
+| `fullname.lastname`   | `string` | The last name of the user (min length: 3)   | No       |
+| `email`               | `string` | A valid email address                       | Yes      |
+| `password`            | `string` | A strong password (min length: 6)           | Yes      |
 
 ---
 
@@ -35,12 +35,14 @@ The following fields are required in the request body:
 #### **Success Response (201):**
 ```json
 {
-  "message": "User registered successfully",
-  "data": {
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+  "user": {
     "id": "1234567890",
-    "name": "John Doe",
-    "email": "john.doe@example.com",
-    "age": 25
+    "fullname": {
+      "firstname": "John",
+      "lastname": "Doe"
+    },
+    "email": "john.doe@example.com"
   }
 }
 ```
@@ -48,7 +50,10 @@ The following fields are required in the request body:
 #### **Error Response (400):**
 ```json
 {
-  "error": "Validation error: Password must be at least 8 characters"
+  "errors": [
+    { "msg": "firstname must exist", "param": "fullname.firstname" },
+    { "msg": "invalid Email", "param": "email" }
+  ]
 }
 ```
 
@@ -58,56 +63,35 @@ The following fields are required in the request body:
 
 ### **1. `user.controller.js`**
 The controller handles the logic for the `/register` endpoint. It:
-- Validates the incoming request data.
-- Checks if the email already exists in the database.
+- Validates the incoming request data using `express-validator`.
 - Hashes the password for security.
 - Creates a new user and saves it to the database.
 
 #### **Implementation:**
 ```javascript
-const User = require('../models/user.model');
-const bcrypt = require('bcrypt');
+const userModel = require("../models/user.model.js");
+const userService = require("../services/user.services.js");
+const { validationResult } = require("express-validator");
 
-exports.registerUser = async (req, res) => {
-    const { name, email, password, age } = req.body;
-
-    try {
-        // Validation
-        if (!name || !email || !password) {
-            return res.status(400).json({ error: "All required fields must be provided." });
-        }
-
-        // Check if email exists
-        const existingUser = await User.findOne({ email });
-        if (existingUser) {
-            return res.status(409).json({ error: "Email already in use." });
-        }
-
-        // Hash password
-        const hashedPassword = await bcrypt.hash(password, 10);
-
-        // Create user
-        const newUser = new User({
-            name,
-            email,
-            password: hashedPassword,
-            age
-        });
-
-        await newUser.save();
-
-        res.status(201).json({
-            message: "User registered successfully",
-            data: {
-                id: newUser._id,
-                name: newUser.name,
-                email: newUser.email,
-                age: newUser.age || null
-            }
-        });
-    } catch (error) {
-        res.status(500).json({ error: "Server error" });
+module.exports.registerUser = async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
     }
+
+    const { fullname, email, password } = req.body;
+
+    const hashPassword = await userModel.hashpassword(password);
+
+    const user = await userService.creatUser({
+        firstname: fullname.firstname,
+        lastname: fullname.lastname,
+        email,
+        password: hashPassword
+    });
+
+    const token = user.generateAuthToken();
+    res.status(201).json({ token, user });
 };
 ```
 
@@ -118,43 +102,76 @@ The model defines the structure of the user data in the database.
 
 #### **Implementation:**
 ```javascript
-const mongoose = require('mongoose');
+const mongoose = require("mongoose");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 
 const userSchema = new mongoose.Schema({
-    name: {
-        type: String,
-        required: true
+    fullname: {
+        firstname: {
+            type: String,
+            required: true,
+            minlength: [3, "first name must be a least 3 characters"]
+        },
+        lastname: {
+            type: String,
+            minlength: [3, "last name must be a least 3 characters"]
+        }
     },
     email: {
         type: String,
         required: true,
-        unique: true
+        unique: true,
+        minlength: [5, "email must be a least 5 characters"]
     },
     password: {
         type: String,
-        required: true
+        required: true,
+        select: false
     },
-    age: {
-        type: Number,
-        required: false
+    socketId: {
+        type: String
     }
-}, { timestamps: true });
+});
 
-module.exports = mongoose.model('User', userSchema);
+userSchema.methods.generateAuthToken = function () {
+    const token = jwt.sign({ _id: this._id }, process.env.JWT_SECRET);
+    return token;
+};
+
+userSchema.methods.comparePassword = async function (password) {
+    return await bcrypt.compare(password, this.password);
+};
+
+userSchema.statics.hashpassword = async function (password) {
+    return await bcrypt.hash(password, 10);
+};
+
+const UserModel = mongoose.model("user", userSchema);
+module.exports = UserModel;
 ```
 
 ---
 
 ### **3. `userroutes.js`**
-The routes file maps the endpoint to the controller function.
+The routes file maps the endpoint to the controller function and includes validation middleware.
 
 #### **Implementation:**
 ```javascript
-const express = require('express');
+const express = require("express");
 const router = express.Router();
-const userController = require('../controllers/user.controller');
+const { body } = require("express-validator");
+const userController = require("../controllers/user.controllers.js");
 
-// POST /users/register
-router.post('/register', userController.registerUser);
+router.post(
+    "/register",
+    [
+        body("email").isEmail().withMessage("invalid Email"),
+        body("fullname.firstname").isLength({ min: 3 }).withMessage("firstname must exist"),
+        body("password").isLength({ min: 6 }).withMessage("password must be at least 6 characters")
+    ],
+    userController.registerUser
+);
 
 module.exports = router;
+```
